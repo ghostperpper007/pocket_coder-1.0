@@ -455,8 +455,8 @@ from transformers import AutoTokenizer
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 
-EMB_DIM     = 600
-STATE_DIM   = 64
+EMB_DIM     = 256
+STATE_DIM   = 32
 MAX_SEQ_LEN = 512
 LR          = 3e-4
 GRAD_CLIP   = 1.0
@@ -548,7 +548,8 @@ class ReasoningBlock(nn.Module):
     def __init__(self, embedding_dim):
         super().__init__()
         self.embedding_dim = embedding_dim
-        self.high_a_proj   = nn.Linear(embedding_dim, embedding_dim * embedding_dim)
+        self.high_a_down   = nn.Linear(embedding_dim, 64)   # bottleneck instead of 600*600
+        self.high_a_up     = nn.Linear(64, embedding_dim)
         self.gate          = nn.Linear(embedding_dim * 2, embedding_dim)
         self.low_a         = nn.Parameter(torch.randn(embedding_dim, embedding_dim) * 0.02)
         self.b_injector    = nn.Linear(embedding_dim, embedding_dim)
@@ -556,9 +557,7 @@ class ReasoningBlock(nn.Module):
         self.delta_proj    = nn.Linear(embedding_dim, embedding_dim)
 
     def forward(self, x, high_hidden, low_hidden, diagnostic_feedback):
-        high_a          = self.high_a_proj(x).view(-1, self.embedding_dim, self.embedding_dim)
-        high_a          = high_a / (self.embedding_dim ** 0.5)
-        new_high_hidden = torch.tanh(torch.bmm(x.unsqueeze(1), high_a).squeeze(1))
+        new_high_hidden = torch.tanh(self.high_a_up(self.high_a_down(x)))
         gate_val        = torch.sigmoid(self.gate(torch.cat([high_hidden, diagnostic_feedback], dim=-1)))
         refinement      = torch.matmul(low_hidden, self.low_a) * gate_val
         new_low_hidden  = torch.tanh(refinement + diagnostic_feedback)
@@ -717,9 +716,9 @@ class ASTDiagnosticSystem(nn.Module):
 
         token_ent  = _token_entropy(ids)
         signal     = torch.tensor([
-            syntax_ok, error_position, depth_score, node_diversity,
-            return_present, func_def_present, undefined_ratio, token_ent,
-        ], dtype=torch.float)
+    syntax_ok, error_position, depth_score, node_diversity,
+    return_present, func_def_present, undefined_ratio, token_ent,
+], dtype=torch.float, device=logits.device)
         signal_seq = signal.unsqueeze(0).expand(seq_len, -1)
         feedback   = self.signal_proj(signal_seq)
         details    = {
@@ -798,7 +797,7 @@ if os.path.exists(CKPT_PATH):
     decoder.load_state_dict(ckpt["decoder"])
     gnn.load_state_dict(ckpt["gnn"])
     token_attn.load_state_dict(ckpt["token_attn"])
-    reasoner.load_state_dict(ckpt["reasoner"])
+    reasoner.load_state_dict(ckpt["reasoner"], strict=False)
     diagnostic.load_state_dict(ckpt["diagnostic"])
     optimizer.load_state_dict(ckpt["optimizer"])
     start_step   = ckpt["step"]
@@ -811,15 +810,41 @@ else:
 # ─────────────────────────────────────────────────────────────────────────────
 # DATA
 # ─────────────────────────────────────────────────────────────────────────────
+
+from kaggle_secrets import UserSecretsClient
+from huggingface_hub import login
+
+secrets = UserSecretsClient()
+token = secrets.get_secret("HF_TOKEN")
+print(f"Token found: {token[:8] if token else 'NONE'}")
+login(token=token)
+
+from datasets import load_dataset
+import itertools
+
 def get_dataset():
-    ds = load_dataset("bigcode/the-stack", data_dir="data/python", 
-                      split="train", streaming=True)
-    return iter(ds)
+    stack = load_dataset("bigcode/the-stack",
+                         data_dir="data/python",
+                         streaming=True,
+                         split="train",
+                         token=token)
+
+    starcoder = load_dataset("bigcode/starcoderdata",
+                             data_dir="python",
+                             streaming=True,
+                             split="train",
+                             token=token)
+
+    combined = itertools.chain(stack, starcoder)
+    return combined
 
 def get_code(sample) -> str:
-    return sample.get("content", "")
-
-
+    code = sample.get("content", "")
+    first_line = next((l.strip() for l in code.splitlines() if l.strip()), "")
+    if not any(first_line.startswith(kw) for kw in
+               ("def ", "class ", "import ", "from ", "#", "@")):
+        return ""
+    return code
 # ─────────────────────────────────────────────────────────────────────────────
 # ONE TRAINING STEP
 # ─────────────────────────────────────────────────────────────────────────────
