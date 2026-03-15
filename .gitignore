@@ -1,0 +1,6 @@
+*.pt
+*.pth
+*.ckpt
+__pycache__/
+*.pyc
+.env
