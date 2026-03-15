@@ -49,7 +49,7 @@ ASTDiagnosticSystem  (live AST parse → differentiable feedback signal)
 
 ## Training
 
-- **Dataset:** `bigcode/the-stack` Python subset (raw source files with comments)
+- **Dataset:** `bigcode/the-stack` Python subset (raw source files with comments) and 'bigcode/starcoderdata'
 - **Objective:** next-token prediction (`cross_entropy` on shifted token IDs)
 - **Optimizer:** AdamW, lr=3e-4, weight_decay=0.01
 - **Gradient clipping:** 1.0
