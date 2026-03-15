@@ -80,18 +80,7 @@ Standard language models receive no signal about whether their output is syntact
 ## Usage
 
 ```python
-# Encode source
-embeddings, target_ids = encoder.encode(source)
-
-# Run pipeline
-features = token_attn(embeddings)
-high_h, low_h, b_bias, c_bias, delta = reasoner(features, high_h, low_h, feedback)
-gnn_features = gnn(high_h, edge_index)
-logits = decoder(gnn_features, b_bias, c_bias)
-
-# Get AST feedback for next pass
-feedback, report = diagnostic.get_feedback(logits.detach())
-print(report.status)   # e.g. "Valid AST"
+#coming soon
 ```
 
 ---
