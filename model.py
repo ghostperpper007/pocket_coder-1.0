@@ -786,7 +786,7 @@ optimizer = torch.optim.AdamW(all_params, lr=LR, weight_decay=0.01)
 # ─────────────────────────────────────────────────────────────────────────────
 # LOAD CHECKPOINT IF EXISTS
 # ─────────────────────────────────────────────────────────────────────────────
-
+'''
 start_step   = 0
 total_tokens = 0
 
@@ -805,8 +805,9 @@ if os.path.exists(CKPT_PATH):
     print(f"Resumed at step {start_step}, tokens seen: {total_tokens:,}")
 else:
     print("No checkpoint found — starting fresh")
+    '''
 
-
+'''
 # ─────────────────────────────────────────────────────────────────────────────
 # DATA
 # ─────────────────────────────────────────────────────────────────────────────
@@ -958,3 +959,5 @@ while True:
     if time.time() - last_ckpt_time >= CKPT_EVERY:
         save_checkpoint(step, total_tokens)
         last_ckpt_time = time.time()
+
+        '''
