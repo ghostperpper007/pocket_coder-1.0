@@ -1,4 +1,4 @@
-# PocketCoder
+# Small Programming Model
 
 A compact, from-scratch Python code model built around a novel combination of graph-based structure encoding, state space model decoding, and a live differentiable AST feedback loop.
 
