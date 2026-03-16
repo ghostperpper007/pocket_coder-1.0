@@ -19,7 +19,7 @@ DEVICE    = torch.device('cpu')
 EMB_DIM   = 256
 STATE_DIM = 32
 MAX_SEQ_LEN = 512
-CKPT_PATH = 'checkpoint (4).pt'
+CKPT_PATH = 'checkpoint (5).pt'
 
 set_deterministic(42)
 
