@@ -28,7 +28,7 @@ def get_model_size_mb(model):
 
 # Loading checkpoint info
 try:
-    ckpt = torch.load('checkpoint (4).pt', map_location='cpu')
+    ckpt = torch.load('checkpoint (7).pt', map_location='cpu')
     ckpt_step = ckpt['step']
     total_tokens = ckpt.get('total_tokens', 0)
     ckpt_available = True
