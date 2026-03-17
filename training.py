@@ -1,5 +1,3 @@
-
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,7 +8,7 @@ import os
 from dataclasses import dataclass
 from typing import Tuple
 from datasets import load_dataset
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
@@ -21,9 +19,16 @@ STATE_DIM   = 32
 MAX_SEQ_LEN = 512
 LR          = 3e-4
 GRAD_CLIP   = 1.0
-CKPT_EVERY  = 600          # seconds — save every 10 minutes
+CKPT_EVERY  = 300
 CKPT_PATH   = "/kaggle/working/checkpoint.pt"
-LOG_EVERY   = 50           # print loss every N steps
+LOAD_PATH   = "/kaggle/input/models/arjimbob/checkpoint5/pytorch/default/1/checkpoint (5).pt"
+LOG_EVERY   = 50
+
+# ── NEW: scheduler + accumulation config ─────────────────────────────────────
+WARMUP_STEPS  = 500    # LR ramps up over first 500 steps
+TOTAL_STEPS   = 50000  # adjust to your expected run length; controls cosine decay
+ACCUM_STEPS   = 8      # accumulate 8 samples before each weight update
+# ─────────────────────────────────────────────────────────────────────────────
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {DEVICE}")
@@ -109,7 +114,7 @@ class ReasoningBlock(nn.Module):
     def __init__(self, embedding_dim):
         super().__init__()
         self.embedding_dim = embedding_dim
-        self.high_a_down   = nn.Linear(embedding_dim, 64)   # bottleneck instead of 600*600
+        self.high_a_down   = nn.Linear(embedding_dim, 64)
         self.high_a_up     = nn.Linear(64, embedding_dim)
         self.gate          = nn.Linear(embedding_dim * 2, embedding_dim)
         self.low_a         = nn.Parameter(torch.randn(embedding_dim, embedding_dim) * 0.02)
@@ -174,7 +179,6 @@ class SSMDecoder(nn.Module):
         a[:seq_len] = A_bar
         b[:seq_len] = B_bar
 
-        # Up-sweep
         step = 1
         while step < p:
             left  = torch.arange(step - 1, p, step * 2)
@@ -185,7 +189,6 @@ class SSMDecoder(nn.Module):
             b[r]  = a[r] * b[l] + b[r]
             step <<= 1
 
-        # Down-sweep (fixed)
         a[p - 1] = 1.0
         b[p - 1] = 0.0
         step = p >> 1
@@ -277,9 +280,9 @@ class ASTDiagnosticSystem(nn.Module):
 
         token_ent  = _token_entropy(ids)
         signal     = torch.tensor([
-    syntax_ok, error_position, depth_score, node_diversity,
-    return_present, func_def_present, undefined_ratio, token_ent,
-], dtype=torch.float, device=logits.device)
+            syntax_ok, error_position, depth_score, node_diversity,
+            return_present, func_def_present, undefined_ratio, token_ent,
+        ], dtype=torch.float, device=logits.device)
         signal_seq = signal.unsqueeze(0).expand(seq_len, -1)
         feedback   = self.signal_proj(signal_seq)
         details    = {
@@ -313,12 +316,13 @@ def get_edge_index(source):
             return torch.tensor([list(row), list(col)], dtype=torch.long)
     except:
         pass
-    return get_edge_index_sequential(source)
+    return get_edge_index_sequential(len(source.split()))
 
-def get_edge_index_sequential(source):
-    n   = len(source)
-    row = list(range(n - 1)) + list(range(1, n))
-    col = list(range(1, n)) + list(range(n - 1))
+def get_edge_index_sequential(n_tokens):
+    if isinstance(n_tokens, str):
+        n_tokens = len(n_tokens.split())
+    row = list(range(n_tokens - 1)) + list(range(1, n_tokens))
+    col = list(range(1, n_tokens)) + list(range(n_tokens - 1))
     return torch.tensor([row, col], dtype=torch.long)
 
 
@@ -344,17 +348,27 @@ all_params = (
 
 optimizer = torch.optim.AdamW(all_params, lr=LR, weight_decay=0.01)
 
+# ── NEW: cosine LR scheduler with warmup ─────────────────────────────────────
+scheduler = get_cosine_schedule_with_warmup(
+    optimizer,
+    num_warmup_steps=WARMUP_STEPS,
+    num_training_steps=TOTAL_STEPS,
+)
 # ─────────────────────────────────────────────────────────────────────────────
-# LOAD CHECKPOINT IF EXISTS
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-'''
-'''
+# LOAD CHECKPOINT
+# ─────────────────────────────────────────────────────────────────────────────
+
 start_step   = 0
 total_tokens = 0
 
-if os.path.exists(CKPT_PATH):
-    print(f"Resuming from checkpoint: {CKPT_PATH}")
-    ckpt = torch.load(CKPT_PATH, map_location=DEVICE)
+load_from = LOAD_PATH
+
+if os.path.exists(load_from):
+    print(f"Resuming from: {load_from}")
+    ckpt = torch.load(load_from, map_location=DEVICE)
     encoder.load_state_dict(ckpt["encoder"])
     decoder.load_state_dict(ckpt["decoder"])
     gnn.load_state_dict(ckpt["gnn"])
@@ -362,14 +376,24 @@ if os.path.exists(CKPT_PATH):
     reasoner.load_state_dict(ckpt["reasoner"], strict=False)
     diagnostic.load_state_dict(ckpt["diagnostic"])
     optimizer.load_state_dict(ckpt["optimizer"])
+    # ── NEW: restore scheduler if it was saved, otherwise fast-forward it ──
+    if "scheduler" in ckpt:
+        scheduler.load_state_dict(ckpt["scheduler"])
+    else:
+        # old checkpoint had no scheduler — fast-forward to match current step
+        # so the LR doesn't restart from warmup incorrectly
+        resumed_step = ckpt["step"]
+        for _ in range(min(resumed_step, TOTAL_STEPS)):
+            scheduler.step()
+        print(f"  [scheduler] fast-forwarded to step {resumed_step}")
+    # ───────────────────────────────────────────────────────────────────────
     start_step   = ckpt["step"]
     total_tokens = ckpt.get("total_tokens", 0)
     print(f"Resumed at step {start_step}, tokens seen: {total_tokens:,}")
 else:
     print("No checkpoint found — starting fresh")
-    '''
 
-'''
+
 # ─────────────────────────────────────────────────────────────────────────────
 # DATA
 # ─────────────────────────────────────────────────────────────────────────────
@@ -382,7 +406,6 @@ token = secrets.get_secret("HF_TOKEN")
 print(f"Token found: {token[:8] if token else 'NONE'}")
 login(token=token)
 
-from datasets import load_dataset
 import itertools
 
 def get_dataset():
@@ -391,15 +414,12 @@ def get_dataset():
                          streaming=True,
                          split="train",
                          token=token)
-
     starcoder = load_dataset("bigcode/starcoderdata",
                              data_dir="python",
                              streaming=True,
                              split="train",
                              token=token)
-
-    combined = itertools.chain(stack, starcoder)
-    return combined
+    return itertools.chain(stack, starcoder)
 
 def get_code(sample) -> str:
     code = sample.get("content", "")
@@ -408,6 +428,8 @@ def get_code(sample) -> str:
                ("def ", "class ", "import ", "from ", "#", "@")):
         return ""
     return code
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ONE TRAINING STEP
 # ─────────────────────────────────────────────────────────────────────────────
@@ -433,13 +455,13 @@ def train_step(source: str):
     delta_accum = torch.zeros(embeddings.size(0), EMB_DIM, device=DEVICE)
     gnn_base    = None
 
-    for i in range(3):                      # 3 passes — faster than 6, still refines
+    for i in range(3):
         if i == 0:
-            features                          = token_attn(embeddings)
+            features                              = token_attn(embeddings)
             high_h, low_h, b_bias, c_bias, delta = reasoner(features, high_h, low_h, feedback)
-            gnn_base                          = gnn(high_h, edge_index)
-            delta_accum                       = (delta_accum * 0.7 + delta * 0.3).clamp(-1, 1)
-            logits                            = decoder(features, b_bias, c_bias)
+            gnn_base                              = gnn(high_h, edge_index)
+            delta_accum                           = (delta_accum * 0.7 + delta * 0.3).clamp(-1, 1)
+            logits                                = decoder(features, b_bias, c_bias)
         else:
             high_h, low_h, b_bias, c_bias, delta = reasoner(
                 gnn_base + delta_accum, high_h, low_h, feedback
@@ -451,15 +473,14 @@ def train_step(source: str):
 
         feedback, _ = diagnostic.get_feedback(logits.detach())
 
-    # next-token prediction: given token[i] predict token[i+1]
-    loss = F.cross_entropy(logits[:-1], target_ids[1:])
+    # ── NEW: scale loss by ACCUM_STEPS so gradients average correctly ─────────
+    loss = F.cross_entropy(logits[:-1], target_ids[1:]) / ACCUM_STEPS
+    # ─────────────────────────────────────────────────────────────────────────
 
-    optimizer.zero_grad()
     loss.backward()
-    torch.nn.utils.clip_grad_norm_(all_params, GRAD_CLIP)
-    optimizer.step()
 
-    return loss.item(), embeddings.size(0)
+    # return the unscaled loss value for logging
+    return loss.item() * ACCUM_STEPS, embeddings.size(0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -475,6 +496,7 @@ def save_checkpoint(step, total_tokens):
         "reasoner"    : reasoner.state_dict(),
         "diagnostic"  : diagnostic.state_dict(),
         "optimizer"   : optimizer.state_dict(),
+        "scheduler"   : scheduler.state_dict(),   # ── NEW
         "step"        : step,
         "total_tokens": total_tokens,
     }, CKPT_PATH)
@@ -493,6 +515,10 @@ last_ckpt_time = time.time()
 loss_accum     = 0.0
 loss_count     = 0
 
+# ── NEW: zero grads once before the loop starts ───────────────────────────────
+optimizer.zero_grad()
+# ─────────────────────────────────────────────────────────────────────────────
+
 while True:
     try:
         sample = next(data_iter)
@@ -507,19 +533,26 @@ while True:
     if loss is None:
         continue
 
-    step         += 1
     total_tokens += n_tokens
     loss_accum   += loss
     loss_count   += 1
 
-    if step % LOG_EVERY == 0:
-        avg_loss = loss_accum / loss_count
-        print(f"step {step:>7} | loss {avg_loss:.4f} | tokens {total_tokens:>12,}")
-        loss_accum = 0.0
-        loss_count = 0
+    # ── NEW: only update weights every ACCUM_STEPS valid samples ─────────────
+    if loss_count % ACCUM_STEPS == 0:
+        torch.nn.utils.clip_grad_norm_(all_params, GRAD_CLIP)
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad()
+        step += 1
 
-    if time.time() - last_ckpt_time >= CKPT_EVERY:
-        save_checkpoint(step, total_tokens)
-        last_ckpt_time = time.time()
+        if step % LOG_EVERY == 0:
+            avg_loss    = loss_accum / loss_count
+            current_lr  = scheduler.get_last_lr()[0]
+            print(f"step {step:>7} | loss {avg_loss:.4f} | lr {current_lr:.2e} | tokens {total_tokens:>12,}")
+            loss_accum  = 0.0
+            loss_count  = 0
 
-        
+        if time.time() - last_ckpt_time >= CKPT_EVERY:
+            save_checkpoint(step, total_tokens)
+            last_ckpt_time = time.time()
+    # ─────────────────────────────────────────────────────────────────────────
