@@ -74,17 +74,15 @@ Standard language models receive no signal about whether their output is syntact
 | GNN layers | 2 |
 | Attention heads | 8 |
 | Reasoning passes | 3 (training), 6 (inference demo) |
-
----
-
-## Usage
-
-```python
-#coming soon
-```
-
----
-
+## current state
+the model is still undertrained
+currently trained on 206m tokens
+and is starting to learn about
+relationships between tokens
+and is still far from valid code
+but has higher confidence and more diversity in its outputs along
+with rephrasing tokens in many ways showing understanding of
+relationships between tokens.
 ## Requirements
 
 ```
