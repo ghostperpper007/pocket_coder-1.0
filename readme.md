@@ -60,7 +60,7 @@ ASTDiagnosticSystem  (live AST parse → differentiable feedback signal)
 
 ## Why AST Feedback?
 
-Standard language models receive no signal about whether their output is syntactically valid until evaluation. PocketCoder closes this loop during training — every forward pass includes a parse attempt, and the resulting structural signals are injected back into the model's hidden state before the next pass. This means the model is trained to condition on its own syntactic quality in real time.
+Standard language models receive no signal about whether their output is syntactically valid until evaluation. My model closes this loop during training — every forward pass includes a parse attempt, and the resulting structural signals are injected back into the model's hidden state before the next pass. This means the model is trained to condition on its own syntactic quality in real time.
 
 ---
 
@@ -74,14 +74,16 @@ Standard language models receive no signal about whether their output is syntact
 | GNN layers | 2 |
 | Attention heads | 8 |
 | Reasoning passes | 3 (training), 6 (inference demo) |
-## current state
-the model is still undertrained
-currently trained on 206m tokens
-and is starting to learn about
-relationships between tokens
-and is still far from valid code
-but has higher confidence and more diversity in its outputs along
-with rephrasing tokens in many ways showing understanding of
+## Roadmap And Future Plans
+- train up to 800m tokens to follow chinchilla scaling laws
+- incorporate into a larger system.This is a spoiler for a system coming in distant future
+and will await development until model is ready
+and then will be developed in private until 
+its ready for the public to use
+- publish on hugging face
+## Current State
+the model is still undertrained and currently trained on 206m tokens and is starting to learn about relationships between tokens
+and is still far from valid code but has higher confidence and more diversity in its outputs alongwith rephrasing tokens in many ways showing understanding of
 relationships between tokens.
 ## Requirements
 
