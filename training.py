@@ -21,7 +21,7 @@ LR          = 3e-4
 GRAD_CLIP   = 1.0
 CKPT_EVERY  = 300
 CKPT_PATH   = "/kaggle/working/checkpoint.pt"
-LOAD_PATH   = "/kaggle/input/models/arjimbob/checkpoint5/pytorch/default/1/checkpoint (5).pt"
+LOAD_PATH   = "/kaggle/input/models/arjimbob/checkpoint7/pytorch/default/1/checkpoint (7).pt"
 LOG_EVERY   = 50
 
 # ── NEW: scheduler + accumulation config ─────────────────────────────────────
@@ -393,36 +393,39 @@ if os.path.exists(load_from):
 else:
     print("No checkpoint found — starting fresh")
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # DATA
 # ─────────────────────────────────────────────────────────────────────────────
-
 from kaggle_secrets import UserSecretsClient
 from huggingface_hub import login
-
-secrets = UserSecretsClient()
-token = secrets.get_secret("HF_TOKEN")
-print(f"Token found: {token[:8] if token else 'NONE'}")
-login(token=token)
-
 import itertools
 
+try:
+    secrets = UserSecretsClient()
+    token = secrets.get_secret("HF_TOKEN")
+    if token:
+        login(token=token)
+        print(f"Token found: {token[:8]}...")
+    else:
+        print("No HF token — using public datasets only")
+except Exception:
+    print("No HF token — using public datasets only")
+
 def get_dataset():
-    stack = load_dataset("bigcode/the-stack",
-                         data_dir="data/python",
-                         streaming=True,
-                         split="train",
-                         token=token)
-    starcoder = load_dataset("bigcode/starcoderdata",
-                             data_dir="python",
-                             streaming=True,
-                             split="train",
-                             token=token)
-    return itertools.chain(stack, starcoder)
+    codesearchnet = load_dataset(
+        "Nan-Do/code-search-net-python",
+        streaming=True,
+        split="train",
+    )
+    codeparrot = load_dataset(
+        "codeparrot/codeparrot-clean-train",
+        streaming=True,
+        split="train",
+    )
+    return itertools.chain(codesearchnet, codeparrot)
 
 def get_code(sample) -> str:
-    code = sample.get("content", "")
+    code = sample.get("whole_func_string", "") or sample.get("content", "")
     first_line = next((l.strip() for l in code.splitlines() if l.strip()), "")
     if not any(first_line.startswith(kw) for kw in
                ("def ", "class ", "import ", "from ", "#", "@")):
