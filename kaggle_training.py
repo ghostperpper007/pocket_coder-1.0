@@ -1,3 +1,156 @@
+"""
+preprocess.py  —  run this ONCE before training
+Saves: /kaggle/working/dataset.pt
+  A list of dicts: {
+      "ids"        : LongTensor (seq_len,)
+      "ast_signal" : FloatTensor (8,)
+      "edge_index" : LongTensor (2, num_edges)
+  }
+"""
+
+import ast
+import math
+import torch
+import itertools
+from transformers import AutoTokenizer
+from datasets import load_dataset
+
+# ── config (must match training script) ──────────────────────────────────────
+MAX_SEQ_LEN  = 512
+MIN_TOKENS   = 2
+SAVE_PATH    = "/kaggle/working/dataset.pt"
+MAX_SAMPLES  = 500_000   # set to None to use everything
+# ─────────────────────────────────────────────────────────────────────────────
+
+tokenizer = AutoTokenizer.from_pretrained("Salesforce/codegen-350M-mono")
+
+# ── AST helpers ───────────────────────────────────────────────────────────────
+
+def _ast_depth(node, depth=0):
+    children = list(ast.iter_child_nodes(node))
+    if not children:
+        return depth
+    return max(_ast_depth(c, depth + 1) for c in children)
+
+def _token_entropy(ids):
+    if len(ids) == 0:
+        return 0.0
+    counts      = torch.bincount(torch.tensor(ids, dtype=torch.long))
+    probs       = counts.float() / counts.sum()
+    probs       = probs[probs > 0]
+    entropy     = -(probs * probs.log()).sum().item()
+    max_entropy = math.log(len(ids) + 1e-9)
+    return entropy / max_entropy if max_entropy > 0 else 0.0
+
+def compute_ast_signal(code_str: str, ids: list) -> torch.Tensor:
+    syntax_ok = error_position = depth_score = 0.0
+    node_diversity = return_present = func_def_present = undefined_ratio = 0.0
+
+    try:
+        tree             = ast.parse(code_str)
+        syntax_ok        = 1.0
+        all_nodes        = list(ast.walk(tree))
+        node_types       = [type(n).__name__ for n in all_nodes]
+        total_nodes      = max(len(all_nodes), 1)
+        raw_depth        = _ast_depth(tree)
+        depth_score      = min(raw_depth / 20.0, 1.0)
+        node_diversity   = len(set(node_types)) / total_nodes
+        return_present   = 1.0 if any(isinstance(n, ast.Return)      for n in all_nodes) else 0.0
+        func_def_present = 1.0 if any(isinstance(n, ast.FunctionDef) for n in all_nodes) else 0.0
+        assigned         = {n.id for n in ast.walk(tree)
+                            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+        used             = {n.id for n in ast.walk(tree)
+                            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+        undefined        = used - assigned - {
+            'True','False','None','print','range','len','int','str',
+            'float','list','dict','set','tuple','type','zip','map','enumerate'
+        }
+        undefined_ratio  = len(undefined) / max(len(used), 1)
+    except SyntaxError as e:
+        total_lines    = max(len(code_str.splitlines()), 1)
+        error_line     = getattr(e, 'lineno', 0) or 0
+        error_position = min(error_line / total_lines, 1.0)
+
+    token_ent = _token_entropy(ids)
+
+    return torch.tensor([
+        syntax_ok, error_position, depth_score, node_diversity,
+        return_present, func_def_present, undefined_ratio, token_ent,
+    ], dtype=torch.float)
+
+def compute_edge_index(code_str: str, n_tokens: int) -> torch.Tensor:
+    try:
+        tree     = ast.parse(code_str)
+        edges    = set()
+        nodes    = list(ast.walk(tree))
+        node_ids = {id(n): i for i, n in enumerate(nodes)}
+        for node in nodes:
+            for child in ast.iter_child_nodes(node):
+                p = node_ids[id(node)]
+                c = node_ids[id(child)]
+                if p != c:
+                    edges.add((p, c))
+                    edges.add((c, p))
+        if edges:
+            row, col = zip(*edges)
+            ei = torch.tensor([list(row), list(col)], dtype=torch.long)
+            return ei.clamp(max=n_tokens - 1)
+    except:
+        pass
+    n   = n_tokens
+    row = list(range(n - 1)) + list(range(1, n))
+    col = list(range(1, n)) + list(range(n - 1))
+    return torch.tensor([row, col], dtype=torch.long)
+
+# ── dataset ───────────────────────────────────────────────────────────────────
+
+def get_dataset():
+    codesearchnet = load_dataset("Nan-Do/code-search-net-python",    streaming=True, split="train")
+    codeparrot    = load_dataset("codeparrot/codeparrot-clean-train", streaming=True, split="train")
+    return itertools.chain(codesearchnet, codeparrot)
+
+def get_code(sample) -> str:
+    code = sample.get("whole_func_string", "") or sample.get("content", "")
+    first_line = next((l.strip() for l in code.splitlines() if l.strip()), "")
+    if not any(first_line.startswith(kw) for kw in
+               ("def ", "class ", "import ", "from ", "#", "@")):
+        return ""
+    return code
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+print("Starting preprocessing...")
+records = []
+skipped = 0
+
+for i, sample in enumerate(get_dataset()):
+    if MAX_SAMPLES and i >= MAX_SAMPLES:
+        break
+
+    code = get_code(sample)
+    if len(code.strip()) < 10:
+        skipped += 1
+        continue
+
+    ids = tokenizer.encode(code, truncation=True, max_length=MAX_SEQ_LEN)
+    if len(ids) < MIN_TOKENS:
+        skipped += 1
+        continue
+
+    records.append({
+        "ids"        : torch.tensor(ids, dtype=torch.long),
+        "ast_signal" : compute_ast_signal(code, ids),
+        "edge_index" : compute_edge_index(code, len(ids)),
+    })
+
+    if len(records) % 10_000 == 0:
+        print(f"  {len(records):,} samples processed (skipped {skipped:,})...")
+
+torch.save(records, SAVE_PATH)
+print(f"\nDone. Saved {len(records):,} samples → {SAVE_PATH}")
+print(f"Skipped {skipped:,} invalid samples.")
+
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -5,36 +158,35 @@ import ast
 import math
 import time
 import os
+import random
 from dataclasses import dataclass
 from typing import Tuple
-from datasets import load_dataset
 from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 
-EMB_DIM     = 256
-STATE_DIM   = 32
-MAX_SEQ_LEN = 512
-LR          = 3e-4
-GRAD_CLIP   = 1.0
-CKPT_EVERY  = 300
-CKPT_PATH   = "/kaggle/working/checkpoint.pt"
-LOAD_PATH   = "/kaggle/input/models/arjimbob/checkpoint7/pytorch/default/1/checkpoint (7).pt"
-LOG_EVERY   = 50
+EMB_DIM      = 256
+STATE_DIM    = 32
+MAX_SEQ_LEN  = 512
+LR           = 3e-4
+GRAD_CLIP    = 1.0
+CKPT_EVERY   = 300
+CKPT_PATH    = "/kaggle/working/checkpoint.pt"
+LOAD_PATH    = "/kaggle/input/models/arjimbob/checkpoint7/pytorch/default/1/checkpoint (7).pt"
+LOG_EVERY    = 50
+DATASET_PATH = "/kaggle/working/dataset.pt"  # output of preprocess.py
 
-# ── NEW: scheduler + accumulation config ─────────────────────────────────────
-WARMUP_STEPS  = 500    # LR ramps up over first 500 steps
-TOTAL_STEPS   = 50000  # adjust to your expected run length; controls cosine decay
-ACCUM_STEPS   = 8      # accumulate 8 samples before each weight update
-# ─────────────────────────────────────────────────────────────────────────────
+WARMUP_STEPS = 500
+TOTAL_STEPS  = 50000
+ACCUM_STEPS  = 8
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {DEVICE}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MODEL
+# MODEL  (completely unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class CodeEncoder(nn.Module):
@@ -47,7 +199,16 @@ class CodeEncoder(nn.Module):
         self.pos_emb     = nn.Embedding(max_seq_len, embedding_dim)
         self.norm        = nn.LayerNorm(embedding_dim)
 
+    def encode_ids(self, id_tensor: torch.Tensor):
+        """Fast path: pre-tokenized ids, skips string processing."""
+        device    = next(self.parameters()).device
+        id_tensor = id_tensor.to(device)
+        positions = torch.arange(len(id_tensor), device=device)
+        x = self.token_emb(id_tensor) + self.pos_emb(positions)
+        return self.norm(x), id_tensor
+
     def encode(self, source: str):
+        """Original string path — kept for inference."""
         ids       = self.tokenizer.encode(source, truncation=True, max_length=self.max_seq_len)
         device    = next(self.parameters()).device
         id_tensor = torch.tensor(ids, dtype=torch.long, device=device)
@@ -245,7 +406,13 @@ class ASTDiagnosticSystem(nn.Module):
         self.signal_dim    = 8
         self.signal_proj   = nn.Linear(self.signal_dim, embedding_dim)
 
+    def feedback_from_signal(self, signal: torch.Tensor, seq_len: int) -> torch.Tensor:
+        """Fast path: uses pre-computed signal instead of live AST parsing."""
+        signal_seq = signal.unsqueeze(0).expand(seq_len, -1)
+        return self.signal_proj(signal_seq)
+
     def get_feedback(self, logits: torch.Tensor) -> Tuple[torch.Tensor, ASTReport]:
+        """Original live path — available for inference/eval."""
         ids      = logits.argmax(dim=-1).tolist()
         code_str = self.encoder.decode(ids)
         seq_len  = logits.size(0)
@@ -295,38 +462,6 @@ class ASTDiagnosticSystem(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# EDGE INDEX HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
-
-def get_edge_index(source):
-    try:
-        tree     = ast.parse(source)
-        edges    = set()
-        nodes    = list(ast.walk(tree))
-        node_ids = {id(n): i for i, n in enumerate(nodes)}
-        for node in nodes:
-            for child in ast.iter_child_nodes(node):
-                p = node_ids[id(node)]
-                c = node_ids[id(child)]
-                if p != c:
-                    edges.add((p, c))
-                    edges.add((c, p))
-        if edges:
-            row, col = zip(*edges)
-            return torch.tensor([list(row), list(col)], dtype=torch.long)
-    except:
-        pass
-    return get_edge_index_sequential(len(source.split()))
-
-def get_edge_index_sequential(n_tokens):
-    if isinstance(n_tokens, str):
-        n_tokens = len(n_tokens.split())
-    row = list(range(n_tokens - 1)) + list(range(1, n_tokens))
-    col = list(range(1, n_tokens)) + list(range(n_tokens - 1))
-    return torch.tensor([row, col], dtype=torch.long)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # BUILD MODEL
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -347,15 +482,11 @@ all_params = (
 )
 
 optimizer = torch.optim.AdamW(all_params, lr=LR, weight_decay=0.01)
-
-# ── NEW: cosine LR scheduler with warmup ─────────────────────────────────────
 scheduler = get_cosine_schedule_with_warmup(
     optimizer,
     num_warmup_steps=WARMUP_STEPS,
     num_training_steps=TOTAL_STEPS,
 )
-# ─────────────────────────────────────────────────────────────────────────────
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOAD CHECKPOINT
@@ -364,11 +495,9 @@ scheduler = get_cosine_schedule_with_warmup(
 start_step   = 0
 total_tokens = 0
 
-load_from = LOAD_PATH
-
-if os.path.exists(load_from):
-    print(f"Resuming from: {load_from}")
-    ckpt = torch.load(load_from, map_location=DEVICE)
+if os.path.exists(LOAD_PATH):
+    print(f"Resuming from: {LOAD_PATH}")
+    ckpt = torch.load(LOAD_PATH, map_location=DEVICE)
     encoder.load_state_dict(ckpt["encoder"])
     decoder.load_state_dict(ckpt["decoder"])
     gnn.load_state_dict(ckpt["gnn"])
@@ -376,17 +505,13 @@ if os.path.exists(load_from):
     reasoner.load_state_dict(ckpt["reasoner"], strict=False)
     diagnostic.load_state_dict(ckpt["diagnostic"])
     optimizer.load_state_dict(ckpt["optimizer"])
-    # ── NEW: restore scheduler if it was saved, otherwise fast-forward it ──
     if "scheduler" in ckpt:
         scheduler.load_state_dict(ckpt["scheduler"])
     else:
-        # old checkpoint had no scheduler — fast-forward to match current step
-        # so the LR doesn't restart from warmup incorrectly
         resumed_step = ckpt["step"]
         for _ in range(min(resumed_step, TOTAL_STEPS)):
             scheduler.step()
         print(f"  [scheduler] fast-forwarded to step {resumed_step}")
-    # ───────────────────────────────────────────────────────────────────────
     start_step   = ckpt["step"]
     total_tokens = ckpt.get("total_tokens", 0)
     print(f"Resumed at step {start_step}, tokens seen: {total_tokens:,}")
@@ -394,69 +519,68 @@ else:
     print("No checkpoint found — starting fresh")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DATA
-# ─────────────────────────────────────────────────────────────────────────────
-from kaggle_secrets import UserSecretsClient
-from huggingface_hub import login
-import itertools
-
-try:
-    secrets = UserSecretsClient()
-    token = secrets.get_secret("HF_TOKEN")
-    if token:
-        login(token=token)
-        print(f"Token found: {token[:8]}...")
-    else:
-        print("No HF token — using public datasets only")
-except Exception:
-    print("No HF token — using public datasets only")
-
-def get_dataset():
-    codesearchnet = load_dataset(
-        "Nan-Do/code-search-net-python",
-        streaming=True,
-        split="train",
-    )
-    codeparrot = load_dataset(
-        "codeparrot/codeparrot-clean-train",
-        streaming=True,
-        split="train",
-    )
-    return itertools.chain(codesearchnet, codeparrot)
-
-def get_code(sample) -> str:
-    code = sample.get("whole_func_string", "") or sample.get("content", "")
-    first_line = next((l.strip() for l in code.splitlines() if l.strip()), "")
-    if not any(first_line.startswith(kw) for kw in
-               ("def ", "class ", "import ", "from ", "#", "@")):
-        return ""
-    return code
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ONE TRAINING STEP
+# LOAD PRE-COMPUTED DATASET
 # ─────────────────────────────────────────────────────────────────────────────
 
-def train_step(source: str):
-    if len(source.strip()) < 10:
+print(f"Loading dataset from {DATASET_PATH}...")
+dataset  = torch.load(DATASET_PATH)
+indices  = list(range(len(dataset)))
+random.shuffle(indices)
+data_pos = 0
+print(f"Loaded {len(dataset):,} samples.")
+
+def next_sample():
+    global data_pos, indices
+    if data_pos >= len(indices):
+        random.shuffle(indices)
+        data_pos = 0
+        print("Dataset reshuffled for next epoch.")
+    record   = dataset[indices[data_pos]]
+    data_pos += 1
+    return record
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SAVE CHECKPOINT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def save_checkpoint(step, total_tokens):
+    torch.save({
+        "encoder"     : encoder.state_dict(),
+        "decoder"     : decoder.state_dict(),
+        "gnn"         : gnn.state_dict(),
+        "token_attn"  : token_attn.state_dict(),
+        "reasoner"    : reasoner.state_dict(),
+        "diagnostic"  : diagnostic.state_dict(),
+        "optimizer"   : optimizer.state_dict(),
+        "scheduler"   : scheduler.state_dict(),
+        "step"        : step,
+        "total_tokens": total_tokens,
+    }, CKPT_PATH)
+    print(f"  [ckpt saved] step={step} | tokens={total_tokens:,}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TRAIN STEP  (model logic identical — only feedback source changed)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def train_step(record: dict):
+    id_tensor  = record["ids"].to(DEVICE)
+    ast_signal = record["ast_signal"].to(DEVICE)  # (8,) pre-computed, no parsing
+    edge_index = record["edge_index"].to(DEVICE)
+
+    if id_tensor.size(0) < 2:
         return None, 0
 
-    embeddings, target_ids = encoder.encode(source)
-    embeddings = embeddings.to(DEVICE)
-    target_ids = target_ids.to(DEVICE)
-
-    if embeddings.size(0) < 2:
-        return None, 0
-
-    edge_index = get_edge_index(source).to(DEVICE)
+    embeddings, target_ids = encoder.encode_ids(id_tensor)
     max_node   = embeddings.size(0) - 1
     edge_index = edge_index.clamp(max=max_node)
 
     high_h      = torch.zeros(embeddings.size(0), EMB_DIM, device=DEVICE)
     low_h       = torch.zeros(embeddings.size(0), EMB_DIM, device=DEVICE)
-    feedback    = torch.zeros(embeddings.size(0), EMB_DIM, device=DEVICE)
     delta_accum = torch.zeros(embeddings.size(0), EMB_DIM, device=DEVICE)
     gnn_base    = None
+
+    # pre-compute feedback from cached signal — no AST parsing, no decode
+    feedback = diagnostic.feedback_from_signal(ast_signal, embeddings.size(0))
 
     for i in range(3):
         if i == 0:
@@ -474,37 +598,9 @@ def train_step(source: str):
             features    = gnn_base + delta_accum * delta_scale * 0.2
             logits      = decoder(features, b_bias, c_bias)
 
-        feedback, _ = diagnostic.get_feedback(logits.detach())
-
-    # ── NEW: scale loss by ACCUM_STEPS so gradients average correctly ─────────
     loss = F.cross_entropy(logits[:-1], target_ids[1:]) / ACCUM_STEPS
-    # ─────────────────────────────────────────────────────────────────────────
-
     loss.backward()
-
-    # return the unscaled loss value for logging
     return loss.item() * ACCUM_STEPS, embeddings.size(0)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SAVE CHECKPOINT
-# ─────────────────────────────────────────────────────────────────────────────
-
-def save_checkpoint(step, total_tokens):
-    torch.save({
-        "encoder"     : encoder.state_dict(),
-        "decoder"     : decoder.state_dict(),
-        "gnn"         : gnn.state_dict(),
-        "token_attn"  : token_attn.state_dict(),
-        "reasoner"    : reasoner.state_dict(),
-        "diagnostic"  : diagnostic.state_dict(),
-        "optimizer"   : optimizer.state_dict(),
-        "scheduler"   : scheduler.state_dict(),   # ── NEW
-        "step"        : step,
-        "total_tokens": total_tokens,
-    }, CKPT_PATH)
-    print(f"  [ckpt saved] step={step} | tokens={total_tokens:,}")
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TRAINING LOOP
@@ -512,26 +608,16 @@ def save_checkpoint(step, total_tokens):
 
 print("\nStarting training...\n")
 
-data_iter      = get_dataset()
 step           = start_step
 last_ckpt_time = time.time()
 loss_accum     = 0.0
 loss_count     = 0
 
-# ── NEW: zero grads once before the loop starts ───────────────────────────────
 optimizer.zero_grad()
-# ─────────────────────────────────────────────────────────────────────────────
 
 while True:
-    try:
-        sample = next(data_iter)
-    except StopIteration:
-        print("Dataset exhausted — restarting stream")
-        data_iter = get_dataset()
-        sample    = next(data_iter)
-
-    source         = get_code(sample)
-    loss, n_tokens = train_step(source)
+    record         = next_sample()
+    loss, n_tokens = train_step(record)
 
     if loss is None:
         continue
@@ -540,7 +626,6 @@ while True:
     loss_accum   += loss
     loss_count   += 1
 
-    # ── NEW: only update weights every ACCUM_STEPS valid samples ─────────────
     if loss_count % ACCUM_STEPS == 0:
         torch.nn.utils.clip_grad_norm_(all_params, GRAD_CLIP)
         optimizer.step()
@@ -549,13 +634,12 @@ while True:
         step += 1
 
         if step % LOG_EVERY == 0:
-            avg_loss    = loss_accum / loss_count
-            current_lr  = scheduler.get_last_lr()[0]
+            avg_loss   = loss_accum / loss_count
+            current_lr = scheduler.get_last_lr()[0]
             print(f"step {step:>7} | loss {avg_loss:.4f} | lr {current_lr:.2e} | tokens {total_tokens:>12,}")
-            loss_accum  = 0.0
-            loss_count  = 0
+            loss_accum = 0.0
+            loss_count = 0
 
         if time.time() - last_ckpt_time >= CKPT_EVERY:
             save_checkpoint(step, total_tokens)
             last_ckpt_time = time.time()
-    # ─────────────────────────────────────────────────────────────────────────
